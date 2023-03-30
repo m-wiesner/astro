@@ -1,0 +1,485 @@
+# ASTRO imports
+from astro.models.Wav2Vec2 import Wav2Vec2
+from astro.iterators.train_phone import train_one_epoch
+from astro.iterators.valid_phone import valid_phone
+from astro.tokenizers.LexiconTokenizer import LexiconTokenizer
+from astro.datasets.Wav2Vec2Dataset import Wav2Vec2Dataset
+from astro.dataprep.mixer6 import prepare_fbank_cuts
+from astro.criteria.CTC import CTC
+
+# Pytorch imports
+import torch
+#from torch.optim.swa_utils import AveragedModel, SWALR
+import torch.multiprocessing as mp
+from torch import distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Lhotse imports
+from lhotse.utils import fix_random_seed
+from lhotse.recipes import prepare_mixer6
+from lhotse import SupervisionSet, RecordingSet, CutSet
+from lhotse.dataset import CutConcatenate, DynamicBucketingSampler
+
+
+# Python imports
+import argparse
+import os
+import sys
+from pathlib import Path
+import logging
+from tqdm import tqdm
+from itertools import chain
+import editdistance
+import glob
+
+
+class _SeedWorkers:
+    def __init__(self, seed: int):
+        self.seed = seed
+
+    def __call__(self, worker_id: int):
+        fix_random_seed(self.seed + worker_id)
+
+
+def setup_dist(rank, world_size, master_port=None, use_ddp_launch=False):
+    """
+    rank and world_size are used only if use_ddp_launch is False.
+    """
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "localhost"
+
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = (
+            "12354" if master_port is None else str(master_port)
+        )
+
+    if use_ddp_launch is False:
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+    else:
+        dist.init_process_group("nccl")
+
+
+def train(args, phones, loss_fn, optim, scaler, lr_sched,
+    train_dloader, dev_dloader, device,
+):
+    '''
+        The main training loop.
+        Inputs:
+            :param args: namespace with the commandline arguments
+            :param phones: a list of the phones used in the lexiconf
+            :param mdl: the neural network model
+            :param loss_fn: the loss_fn, (astro/criteria/CTC.py for instance)
+            :param optim: the optimizer used for training
+            :param lr_sched: the learning rate scheduler for the optimizer
+            :param train_dloader: the pytorch data loader
+            :param dev_dloader: the pytorch dev data loader
+            :param device: the device (cpu / cuda) on which to train
+    '''
+    # This list is just a queue, which keeps track of the paths of the last few
+    # models from the previous args.keep_last epochs. To save disk space, we
+    # remove all epochs prior to this.
+    saved_epochs = []
+   
+    # The main training loop (from start_epoch to the total number of epochs)
+    for e in range(args.start_epoch, args.epochs):
+        logging.info(f"Epoch {e+1} of {args.epochs}")
+        # We need to set the epoch in order to shuffle the lhotse sampler
+        train_dloader.sampler.set_epoch(e)
+        
+        # The Wav2Vec2 model is frozen at the beginning
+        # (only the classifier is trained)
+        if e >= args.wav2vec2_num_freeze_epochs:
+            if args.world_size > 1:
+                loss_fn.module.unfreeze_mdl()
+            else:
+                loss_fn.unfreeze_mdl()
+        # Train one epoch. This is the main training loop
+        # astro/iterators/train_phone.py
+        train_one_epoch(
+            phones, loss_fn, optim, lr_sched, scaler, train_dloader,
+            device, wer_logging=args.wer_logging, fp16=args.fp16,
+            grad_thresh=args.grad_thresh, print_interval=args.print_interval,
+        )
+
+        # In DDP if the device index is 0, then we run a validation step
+        if device.index == 0:
+            if dev_dloader is not None:
+                # This is the main validation loop
+                # (astro/iterators/valid_phone.py)
+                loss_val, wer = valid_phone(
+                    phones, loss_fn, dev_dloader, device,
+                    wer_logging=args.wer_logging,
+                    fp16=args.fp16,
+                )
+            else:
+                loss_val, wer = None, None
+
+            wer_str = f"WER: {wer:.02f}" if args.wer_logging else ''
+            logging_string = f'''
+            --------------------------------------------
+            Epoch: {e+1} Loss_Val: {loss_val} {wer_str}
+            --------------------------------------------
+            '''
+            logging.info(logging_string)
+
+            # Save trained model
+            state_dict = {
+                'criterion_and_model': loss_fn.module.state_dict(),
+                'optimizer': optim.state_dict(),
+                'scaler': scaler.state_dict() if scaler is not None else None,
+                'lr_sched': lr_sched.state_dict(),
+                'epoch': e,
+                'loss': loss_val,
+                'wer': wer,
+            }
+
+            if e % args.save_interval == 0:
+                mdl_path = f'{args.expdir}/{e+1}.mdl'
+                torch.save(state_dict, mdl_path)
+                saved_epochs.insert(0, (mdl_path, e))
+
+            # Remove old checkpoint
+            if len(saved_epochs) > args.keep_last:
+                mdl_path, e = saved_epochs.pop()
+                if e % args.keep_interval != 0:
+                    os.remove(mdl_path)
+
+
+def get_args():
+    '''
+        Parse the input arguments
+    '''
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, default=None, help='The path to the mixer6 audio')
+    parser.add_argument('--transcripts', type=str, default=None, help='Path to the mixer6 transcripts')
+    parser.add_argument('--world-size', type=int, default=4, help='Number of GPUs')
+    parser.add_argument('--lexicon', type=str, default=None, help='The path to the mixer6 pronunciation lexicon')
+    parser.add_argument('--phones', type=str, default=None, help='The path to the phone list used in the lexicon. If it does not exist it will be created and dumped.')
+    parser.add_argument('--max-duration', type=float, default=20.0, help='remove utterances that are longer than this duration from training')
+    parser.add_argument('--min-duration', type=float, default=1.0, help='remove utterances that are shorter than this duration from training')
+    parser.add_argument('--minibatch-duration', type=float, default=550.0, help='the total duration of utterances in the minibatch')   
+    parser.add_argument('--num-buckets', type=int, default=30, help='total number of buckets for BucketingSampler')
+    parser.add_argument('--num-workers', type=int, default=2, help='number of workers for the pytorch data loader')
+    parser.add_argument('--lr', type=float, default=0.001, help='the maximum learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-06, help='optimizer weight decay')
+    parser.add_argument('--epochs', type=int, default=50, help='the number of epochs of training')
+    parser.add_argument('--grad-thresh', type=float, default=5.0, help='the gradient threshold for gradient clipping')
+    parser.add_argument('--fp16', action='store_true', help='use 16bit precision')
+    parser.add_argument('--datadir', type=str, default='./data', help='the directory where data, i.e., features and cuts will be stored')
+    parser.add_argument('--shardir', type=str, default=None, help="the directory where the shar data are stored")
+    parser.add_argument('--expdir', type=str, default='.', help='the directory in which experiments and models will be stored')
+    parser.add_argument('--print-interval', type=int, default=1, help='number of minibatches before prtining training statistics')
+    parser.add_argument('--save-interval', type=int, default=1, help='number of epochs between saves of the model to disk')
+    parser.add_argument('--keep-interval', type=int, default=10, help='keep each {keep_interval} checkpoints')
+    parser.add_argument('--wer-logging', action='store_true', help='print out the WER or PER per minibatch as well a an example decoded utterance')
+    parser.add_argument('--keep-last', type=int, default=5, help='keep the last {keep_last} models and delete the ones prior to this')
+    parser.add_argument('--resume', type=str, default=None, help='the checkpoint (state_dict) from which to resume training')
+    parser.add_argument('--num-mel', type=int, default=64, help='number of log mel filterbanks to use for speech features')
+    parser.add_argument('--master-port', type=int, default=12345)
+    parser.add_argument('--skip-data-prep', action='store_true', help='skip the data preparation part')
+    parser.add_argument('--speed-perturb', action='store_true', help='use 3x speed perturbation in training')
+    args, leftover = parser.parse_known_args()
+    Wav2Vec2.add_args(parser)
+    parser.parse_args(leftover, namespace=args)
+    return args
+
+
+def main(rank, world_size, args):
+    # Fix the random seed
+    fix_random_seed(42)
+
+    # Set up logging
+    logging.basicConfig(
+        format='%(asctime)s -- %(levelname)s:%(message)s',
+        level=logging.DEBUG,
+        handlers=[
+            logging.FileHandler(
+                filename=f"{args.expdir}/log.{rank}",
+                encoding='utf-8',
+                mode='w',
+            ),
+        ],
+    )
+    # Set up distributed training (on multiple GPU) if the world_size,
+    # i.e., num_gpus requested > 1
+    if world_size > 1:
+        setup_dist(rank, world_size, master_port=args.master_port)
+  
+    # Load the cuts (already packaged as feats + supervisions)
+    supervisions_train_intv = SupervisionSet.from_jsonl(
+        f"{args.datadir}/supervisions_train_intv.jsonl.gz"
+    )
+    recordings_train_intv = RecordingSet.from_jsonl(
+        f"{args.datadir}/recordings_train_intv.jsonl.gz" 
+    )
+    
+    supervisions_train_call = SupervisionSet.from_jsonl(
+        f"{args.datadir}/supervisions_train_call.jsonl.gz"
+    )
+    recordings_train_call = RecordingSet.from_jsonl(
+        f"{args.datadir}/recordings_train_call.jsonl.gz" 
+    )
+
+    supervisions_dev = SupervisionSet.from_jsonl(
+        f"{args.datadir}/supervisions_dev_a.jsonl.gz"
+    )
+    recordings_dev = RecordingSet.from_jsonl(
+        f"{args.datadir}/recordings_dev_a.jsonl.gz" 
+    )
+    
+    #cuts_train_call = CutSet.from_manifests(
+    #    recordings=recordings_train_call,
+    #    supervisions=supervisions_train_call,
+    #)
+    #
+    #cuts_train_intv = CutSet.from_manifests(
+    #    recordings=recordings_train_intv,
+    #    supervisions=supervisions_train_intv,
+    #)
+
+    files = [ d + "/cuts.jsonl.gz" for d in sorted(glob.glob(f"{args.shardir}/shard.*")) ]
+    recos = [ d + "/recording.tar" for d in sorted(glob.glob(f"{args.shardir}/shard.*")) ]
+    import pdb; pdb.set_trace()
+    cuts_train = CutSet.from_shar(fields={"cuts": files, "recording": recos}, seed="randomized", shuffle_shards=True)
+
+    cuts_dev = CutSet.from_manifests(
+        recordings=recordings_dev,
+        supervisions=supervisions_dev,
+    )
+    
+    #cuts_train = cuts_train_call + cuts_train_intv
+    #cuts_train = cuts_train.trim_to_supervisions(keep_overlapping=False)
+    cuts_train = cuts_train.filter(
+        lambda c: args.min_duration <= c.duration < args.max_duration
+    )
+    cuts_dev = cuts_dev.trim_to_supervisions(keep_overlapping=False)
+
+    # Load the lexicon and phones
+    lexicon = {}
+    phoneset = set()
+    with open(args.lexicon, 'r', encoding='utf-8') as f:
+        for l in f:
+            # The lexicon format is
+            # word1 p11 p12 p13
+            # word2 p21 p22 p23 p24
+            # ...
+            w, phones = l.strip().split(None, 1)
+            # Add the word to the lexicon if it has not yet been seen
+            if w not in lexicon:
+                lexicon[w] = set()
+            phone_list = phones.split()
+            # Add a new pronunciation for word w. We convert to tuple because
+            # a tuple is hashable, but not a list and sets need hashable elements
+            lexicon[w].add(tuple(phone_list))
+            # Add new phones to phones set that we may later dump to the phones
+            # path
+            for p in phone_list:
+                phoneset.add(p)
+
+    phonespath = Path(args.phones)
+    # Use the existing phones index if provided
+    if phonespath.absolute().is_file():
+        # Gather the set of all phones that will be used. The format for the
+        # phones.txt file is
+        # <eps> 0
+        # p1 1
+        # p2 2
+        # ...
+        phoneset = []
+        with open(args.phones, 'r', encoding='utf-8') as f:
+            for l in f:
+                p, _ = l.strip().split(None, 1)
+                phoneset.append(p)
+    # Otherwise, dump the index
+    else:
+        phonespath.absolute().parent.mkdir(parents=True, exist_ok=True) 
+        phoneset = ['<eps>'] + sorted(phoneset)
+        with open(args.phones, 'w', encoding='utf-8') as f:
+            for idx_p, p in enumerate(phoneset):
+                print(f'{p} {idx_p}', file=f)
+ 
+    # Create the PhoneCollater from the lexicon and phones. The tokenizer is
+    # responsible for converting the transcripts of a set of utterances into 
+    # integers representing the tokens into which the transcripts were
+    # decomposed. If the tokenizer already exists, then load it. Otherwise,
+    # create the tokenizer and dump it to the exp directory.
+    tokenizerpath = Path(f"{args.expdir}/tokenizer.bz2")
+    if tokenizerpath.is_file():
+        tokenizer = LexiconTokenizer.load(str(tokenizerpath))
+        logging.warning(f"Loading prexisting tokenizer. To discard the current "
+            f"tokenizer, stop execution and remove {args.expdir}/tokenizer.bz2"
+        ) 
+    else:
+        tokenizer = LexiconTokenizer(lexicon, phoneset)
+        if rank == 0:
+            tokenizer.serialize(f"{args.expdir}/tokenizer.bz2")
+
+    # Note that Wav2Vec2 models do not use specaugment. It is done internally
+    # on the feature extractor
+
+    # Now we create the datasets. Note that we do not use SpecAugment for the
+    # dev dataset
+    ds = Wav2Vec2Dataset(
+        tokenizer,
+        #cut_transforms=[CutConcatenate(duration_factor=1.0, gap=1.0)],
+    )
+    ds_dev = Wav2Vec2Dataset(
+        tokenizer,
+        #cut_transforms=[CutConcatenate(duration_factor=1.0, gap=1.0)],
+    )
+
+    # Create the training sampler and data loader
+    train_sampler = DynamicBucketingSampler(
+        cuts_train,
+        max_duration=args.minibatch_duration,
+        shuffle=True,
+        num_buckets=args.num_buckets,
+    )
+    
+    train_dloader = torch.utils.data.DataLoader(
+        ds,
+        sampler=train_sampler,
+        batch_size=None,
+        num_workers=args.num_workers,
+        persistent_workers=False,
+        worker_init_fn=_SeedWorkers(torch.randint(0, 100000, ()).item())
+    )
+
+    # Create the dev sampler and data loader
+    dev_sampler = DynamicBucketingSampler(
+        cuts_dev,
+        max_duration=600,
+        shuffle=False,
+    )
+
+    dev_dloader = torch.utils.data.DataLoader(
+        ds_dev,
+        sampler=dev_sampler,
+        batch_size=None,
+        num_workers=0,
+        persistent_workers=False,
+    )
+
+    # Create the model and distribute across GPUs
+    mdl = Wav2Vec2(modelpath=args.wav2vec2_model_path)
+    
+    # Create the loss function. In ASTRO, the loss function has the linear
+    # layer "built-in", so we need to know the dimension of the inputs to that
+    # layer as well as the number of outputs of that layer. The inputs are the
+    # dimension of the model outputs. The linear layer then outputs as many
+    # phones as we have in our lexicon.
+    loss_fn = CTC(mdl, len(phoneset)) 
+    loss_fn.freeze_mdl()
+
+    # Resume training from checkpoint (if provided)
+    args.start_epoch = 0
+    if args.resume is not None:
+        params_dict = torch.load(args.resume, map_location='cpu')
+        loss_fn.load_state_dict(params_dict['criterion_and_model'])
+        args.start_epoch = mdl_dict['epoch'] + 1
+
+    # DistributedDataParallel for multigpu training
+    device = torch.device(
+        f"cuda:{rank}" if torch.cuda.is_available() and args.world_size > 0 else "cpu"
+    )
+
+    loss_fn.to(device)
+    if world_size > 1:
+        loss_fn = DDP(loss_fn, device_ids=[rank])
+
+    # Create the optimizer
+    params = list(loss_fn.parameters())
+    
+    optim = torch.optim.Adam(
+        params, lr=args.lr, weight_decay=args.weight_decay,
+    )
+
+    
+    # Set up the learning rate scaler needed for fp16 computation if requested
+    scaler = None
+    if args.fp16:
+        logging.info("Using fp16 operations")
+        scaler = torch.cuda.amp.GradScaler()
+
+    if args.resume is not None:
+        optim.load_state_dict(mdl_dict['optimizer'])
+        for state in optim.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device)
+        # Create the LR-Schedule, possibly resuming from a checkpoint
+        lr_sched = torch.optim.lr_scheduler.OneCycleLR(
+            optim, max_lr=args.lr,
+            steps_per_epoch=sum(1 for b in train_dloader.sampler),
+            epochs=args.epochs,
+        )
+        lr_sched.load_state_dict(mdl_dict['lr_sched'])
+        if args.fp16:
+            scaler.load_state_dict(mdl_dict['scaler'])
+    else:
+        lr_sched = torch.optim.lr_scheduler.OneCycleLR(
+            optim, max_lr=args.lr,
+            total_steps=6000,
+        )
+
+    # Run the main training loop now that everything is set up
+    train(args, phoneset, loss_fn, optim, scaler, lr_sched,
+        train_dloader, dev_dloader, device,
+    ) 
+
+
+if __name__ == "__main__":
+    args = get_args()
+    # Make expdir if it does not exist
+    expdirpath = Path(args.expdir)
+    expdirpath.absolute().mkdir(parents=True, exist_ok=True)
+
+    # Make datadir if it does not exist
+    datadirpath = Path(args.datadir)
+    datadirpath.absolute().mkdir(parents=True, exist_ok=True) 
+    
+    # Create the a configurations file storing the experiment configuartions
+    # if it doesn't yet exist.
+    confpath = Path(f'{args.expdir}/conf.json')
+    import json
+    json.dump(
+        vars(args),
+        open(confpath, 'w'),
+        indent=4, separators=(',', ': ')
+    )
+    with open(f'{args.expdir}/command.txt', 'w', encoding='utf-8') as f:
+        print(sys.argv, file=f) 
+   
+    # Prepare data
+    if not args.skip_data_prep:
+        parts = [
+            'train_intv',
+            'train_call',
+            'dev_a',
+            'test',
+        ]
+        for p in tqdm(parts):
+            prepare_mixer6(
+                args.data, args.transcripts, part=p, output_dir=args.datadir,
+            )
+            sp = (p in ('train_intv', 'train_call') and args.speed_perturb)
+            prepare_fbank_cuts(
+                args.datadir, p, args.num_mel, args.datadir,
+                speed_perturb=sp,
+                num_jobs=80,
+            )
+
+    logging.basicConfig(level=logging.DEBUG)
+    # spawn the word_size number of jobs
+    world_size = args.world_size
+    assert world_size >= 1
+    if world_size > 1:
+        mp.spawn(main, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        main(rank=0, world_size=1, args=args)
+
+
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
